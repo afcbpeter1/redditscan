@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // ─────────────────────────────────────────────────────────────────────────────
-// reddit-scan.js — Find product opportunities from real Reddit pain points
-// Requires: Node 18+  |  ANTHROPIC_API_KEY env var
+// reddit-scan.js — Find product opportunities from real pain points
+// Sources: Hacker News, Stack Exchange, and (optionally) GitHub Issues.
+// Reddit's unauthenticated endpoints are blocked as of 2026 — see README notes.
+// Requires: Node 18+  |  ANTHROPIC_API_KEY env var  |  optional GITHUB_TOKEN
 //
 // Usage:
-//   ANTHROPIC_API_KEY=sk-ant-... node reddit-scan.js
-//   ANTHROPIC_API_KEY=sk-ant-... node reddit-scan.js --topic "web accessibility"
+//   node reddit-scan.js
+//   node reddit-scan.js --topic "web accessibility"
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { readFileSync } from "fs";
@@ -20,6 +22,8 @@ try {
 } catch {}
 
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+
 if (!ANTHROPIC_API_KEY) {
   console.error("\n❌  Set ANTHROPIC_API_KEY in a .env file or environment variable first.\n");
   process.exit(1);
@@ -27,25 +31,20 @@ if (!ANTHROPIC_API_KEY) {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const SUBREDDITS = [
-  // core startup / builder communities
-  "entrepreneur", "SaaS",
+// Stack Exchange sites (subdomain form, no ".stackexchange.com")
+// stackoverflow deliberately excluded — it's Q&A about writing code, not "does a tool for X exist"
+const SE_SITES = ["softwarerecs", "webapps", "superuser", "workplace", "ux"];
 
-  // dev & technical
-  "webdev", "devops", "selfhosted",
-
-  // work & business ops
-  "productivity", "smallbusiness", "freelance", "consulting",
-  "projectmanagement", "remotework", "sales", "recruiting",
-
-  // marketing & growth
-  "marketing", "SEO", "socialmediamarketing", "ecommerce", "shopify",
-
-  // data & tools
-  "nocode", "automation", "datascience", "excel",
-
-  // niche high-signal verticals
-  "digitalnomad", "accounting", "PropertyManagement", "realestateinvesting",
+// Discourse-powered community forums — /search.json is a built-in, documented
+// feature of the Discourse platform (not scraping), verified reachable below.
+const DISCOURSE_FORUMS = [
+  "https://community.n8n.io",            // automation
+  "https://forum.bubble.io",             // no-code
+  "https://community.home-assistant.io", // self-hosted / smart home
+  "https://discuss.python.org",          // dev / data
+  "https://community.retool.com",        // internal tools / no-code
+  "https://forum.freecodecamp.org",      // dev learning / career
+  "https://community.latenode.com",      // automation
 ];
 
 const PAIN_QUERIES = [
@@ -58,6 +57,8 @@ const PAIN_QUERIES = [
   "wish someone would build",
   "hate how",
 ];
+
+const aiNoise = /\b(chatgpt|gpt-?[0-9]|llm|claude|gemini|copilot|ai tool|ai can|using ai|with ai|openai|midjourney|stable diffusion|dall-?e)\b/i;
 
 const TOPIC_ARG = process.argv.find((a, i) => process.argv[i - 1] === "--topic");
 
@@ -108,98 +109,262 @@ function section(title) {
   console.log(org("━".repeat(60)));
 }
 
-// ── Reddit API ────────────────────────────────────────────────────────────────
+// ── Shared fetch helper (handles 429 with backoff) ──────────────────────────────
 
-async function fetchRedditPosts(subreddit, query, limit = 20) {
+async function fetchWithRetry(url, opts = {}, retries = 3) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const res = await fetch(url, opts);
+    if (res.status === 429) {
+      if (attempt === retries) throw new Error(`Rate limited (429) after ${retries} retries`);
+      const retryAfter = Number(res.headers.get("retry-after")) || 2 ** attempt * 2;
+      await sleep(retryAfter * 1000);
+      continue;
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+    return res.json();
+  }
+}
+
+function decodeHTML(str) {
+  if (!str) return str;
+  return str
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)));
+}
+
+function stripHTML(str) {
+  return decodeHTML((str || "").replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+// ── Hacker News (Algolia Search API — public, no auth) ──────────────────────────
+
+async function fetchHN(query, limit = 25) {
+  const params = new URLSearchParams({ query, hitsPerPage: String(limit) });
+  const data = await fetchWithRetry(`https://hn.algolia.com/api/v1/search?${params}`);
+
+  return (data.hits || []).map(h => {
+    const isComment = !!h.comment_text;
+    return {
+      title:    isComment ? (h.story_title || "(HN comment)") : (h.title || h.story_title || ""),
+      score:    h.points || 0,
+      comments: h.num_comments || 0,
+      sub:      "Hacker News",
+      url:      h.url || `https://news.ycombinator.com/item?id=${h.objectID}`,
+      body:     stripHTML(isComment ? h.comment_text : h.story_text).slice(0, 300),
+    };
+  });
+}
+
+// ── Stack Exchange (public API, no auth needed for read) ────────────────────────
+
+async function fetchStackExchange(site, query, limit = 20) {
   const params = new URLSearchParams({
-    q: query,
-    restrict_sr: "1",
-    sort: "relevance",
-    t: "year",
-    limit: String(limit),
+    q: query, site, order: "desc", sort: "relevance", pagesize: String(limit), filter: "default",
   });
-  const url = `https://www.reddit.com/r/${subreddit}/search.json?${params}`;
+  const data = await fetchWithRetry(`https://api.stackexchange.com/2.3/search/advanced?${params}`);
+  if (data.error_id) throw new Error(data.error_message || `error_id ${data.error_id}`);
 
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-      "Accept": "application/json",
-    },
+  const posts = (data.items || []).map(it => ({
+    title:    decodeHTML(it.title || ""),
+    score:    it.score || 0,
+    comments: it.answer_count || 0,
+    sub:      site,
+    url:      it.link,
+    body:     "",
+  }));
+
+  return { posts, quotaRemaining: data.quota_remaining, backoff: data.backoff };
+}
+
+// ── Discourse forums (built-in /search.json — public, no auth) ──────────────────
+
+async function fetchDiscourse(forumBase, query, limit = 20) {
+  const params = new URLSearchParams({ q: query });
+  const data = await fetchWithRetry(`${forumBase}/search.json?${params}`, {
+    headers: { "User-Agent": "Mozilla/5.0 (compatible; signal-scanner/1.0)" },
   });
 
-  if (res.status === 429) throw new Error("Rate limited by Reddit — wait a moment and retry");
-  if (!res.ok) throw new Error(`Reddit returned ${res.status} for r/${subreddit}`);
+  const posts  = data.posts  || [];
+  const topics = data.topics || [];
+  const n = Math.min(posts.length, topics.length, limit);
+  const host = new URL(forumBase).hostname;
 
-  const data = await res.json();
-  return (data?.data?.children || []).map(c => ({
-    title:    c.data.title,
-    score:    c.data.score,
-    comments: c.data.num_comments,
-    sub:      c.data.subreddit,
-    url:      `https://reddit.com${c.data.permalink}`,
-    body:     (c.data.selftext || "").slice(0, 300).replace(/\n/g, " "),
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const t = topics[i], p = posts[i];
+    if (!t || !p) continue;
+    out.push({
+      title:    t.title || "",
+      score:    p.like_count || 0,
+      comments: t.reply_count || 0,
+      sub:      host,
+      url:      `${forumBase}/t/${t.slug}/${t.id}`,
+      body:     stripHTML(p.blurb).slice(0, 300),
+    });
+  }
+  return out;
+}
+
+// ── GitHub Issues (optional — only runs if GITHUB_TOKEN is set) ─────────────────
+
+async function fetchGitHubIssues(query, limit = 15) {
+  const params = new URLSearchParams({
+    q: `${query} in:title,body is:issue`, sort: "reactions", order: "desc", per_page: String(limit),
+  });
+  const data = await fetchWithRetry(`https://api.github.com/search/issues?${params}`, {
+    headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: "application/vnd.github+json" },
+  });
+
+  return (data.items || []).map(it => ({
+    title:    it.title || "",
+    score:    it.reactions?.total_count || 0,
+    comments: it.comments || 0,
+    sub:      (it.repository_url || "").split("/").slice(-2).join("/") || "GitHub",
+    url:      it.html_url,
+    body:     stripHTML(it.body).slice(0, 300),
   }));
 }
+
+// ── Gather + merge ────────────────────────────────────────────────────────────
 
 async function gatherPosts(topicHint) {
   const allPosts = [];
   const seen     = new Set();
 
-  let subs    = SUBREDDITS;
-  let queries = PAIN_QUERIES;
+  const add = posts => {
+    let n = 0;
+    for (const p of posts) {
+      if (p.url && p.title && p.title.length > 15 && !seen.has(p.url) && !aiNoise.test(p.title)) {
+        seen.add(p.url);
+        allPosts.push(p);
+        n++;
+      }
+    }
+    return n;
+  };
 
-  if (topicHint) {
-    queries = [`${topicHint} problem`, `${topicHint} wish there was`, `${topicHint} frustrated`, `${topicHint} looking for tool`];
-    subs    = SUBREDDITS.slice(0, 6);
+  const hnQueries = topicHint
+    ? [`${topicHint} problem`, `${topicHint} wish there was`, `${topicHint} frustrated`, `${topicHint} looking for tool`]
+    : PAIN_QUERIES;
+  const seQueries = hnQueries.slice(0, 3);
+
+  // Hacker News
+  for (const q of hnQueries) {
+    info(`Hacker News ← "${q}"`);
+    try {
+      add(await fetchHN(q));
+    } catch (e) {
+      warn(`Hacker News skipped: ${e.message}`);
+    }
+    await sleep(800);
   }
 
-  let total = 0;
-
-  for (const sub of subs) {
-    for (const q of queries.slice(0, 3)) {
-      info(`r/${sub} ← "${q}"`);
+  // Stack Exchange
+  let seQuotaLow = false;
+  seLoop: for (const site of SE_SITES) {
+    if (seQuotaLow) break;
+    for (const q of seQueries) {
+      info(`${site}.stackexchange ← "${q}"`);
       try {
-        const posts = await fetchRedditPosts(sub, q, 15);
-        for (const p of posts) {
-          const aiNoise = /\b(chatgpt|gpt-?[0-9]|llm|claude|gemini|copilot|ai tool|ai can|using ai|with ai|openai|midjourney|stable diffusion|dall-?e)\b/i;
-          if (!seen.has(p.url) && p.title.length > 20 && !aiNoise.test(p.title)) {
-            seen.add(p.url);
-            allPosts.push(p);
-            total++;
-          }
+        const { posts, quotaRemaining, backoff } = await fetchStackExchange(site, q);
+        add(posts);
+        if (backoff) await sleep(backoff * 1000);
+        if (quotaRemaining !== undefined && quotaRemaining < 5) {
+          warn("Stack Exchange daily quota nearly exhausted — stopping Stack Exchange fetches");
+          seQuotaLow = true;
+          break seLoop;
         }
-        await sleep(4000 + Math.random() * 3000); // 4–7s random delay, looks human
       } catch (e) {
-        warn(`Skipped r/${sub}: ${e.message}`);
+        warn(`${site} skipped: ${e.message}`);
       }
+      await sleep(1200);
     }
   }
 
-  ok(`Collected ${total} unique posts`);
+  // Discourse forums
+  for (const forum of DISCOURSE_FORUMS) {
+    const host = new URL(forum).hostname;
+    for (const q of seQueries) {
+      info(`${host} ← "${q}"`);
+      try {
+        add(await fetchDiscourse(forum, q));
+      } catch (e) {
+        warn(`${host} skipped: ${e.message}`);
+      }
+      await sleep(1200);
+    }
+  }
 
-  // Sort by engagement
+  // GitHub Issues (optional)
+  if (GITHUB_TOKEN) {
+    for (const q of seQueries) {
+      info(`GitHub issues ← "${q}"`);
+      try {
+        add(await fetchGitHubIssues(q));
+      } catch (e) {
+        warn(`GitHub skipped: ${e.message}`);
+      }
+      await sleep(2500);
+    }
+  } else {
+    info("Skipping GitHub Issues — set GITHUB_TOKEN in .env to include this source");
+  }
+
+  ok(`Collected ${allPosts.length} unique posts`);
+
   return allPosts.sort((a, b) => (b.score + b.comments * 3) - (a.score + a.comments * 3));
+}
+
+// Raw score/comment scales differ wildly by platform (HN points run 10-100x
+// higher than Discourse likes or SE scores), so a flat top-N slice would let
+// one source crowd out everyone else. Cap posts per source instead.
+function diversify(posts, perSourceCap = 5, total = 60) {
+  const perSource = new Map();
+  const pool = [];
+  for (const p of posts) {
+    const n = perSource.get(p.sub) || 0;
+    if (n >= perSourceCap) continue;
+    perSource.set(p.sub, n + 1);
+    pool.push(p);
+    if (pool.length >= total) break;
+  }
+  return pool;
 }
 
 // ── Claude API ────────────────────────────────────────────────────────────────
 
-async function claudeJSON(system, user) {
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type":  "application/json",
-      "x-api-key":     ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify({
-      model:      "claude-opus-4-5",
-      max_tokens: 4000,
-      system,
-      messages: [{ role: "user", content: user }],
-    }),
-  });
+async function claudeJSON(system, user, retries = 2) {
+  let res, data;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "x-api-key":     ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model:      "claude-opus-4-5",
+        max_tokens: 4000,
+        system,
+        messages: [{ role: "user", content: user }],
+      }),
+    });
 
-  const data = await res.json();
+    if (res.status === 429 || res.status === 529) {
+      if (attempt === retries) break;
+      await sleep((2 ** attempt) * 2000);
+      continue;
+    }
+    break;
+  }
+
+  data = await res.json();
   if (!res.ok) throw new Error(`Claude API ${res.status}: ${data.error?.message || JSON.stringify(data)}`);
 
   const text = data.content.filter(b => b.type === "text").map(b => b.text).join("").trim();
@@ -211,12 +376,12 @@ async function claudeJSON(system, user) {
 
 async function analyseThemes(posts) {
   const postList = posts.slice(0, 60).map((p, i) =>
-    `[${i + 1}] r/${p.sub} ↑${p.score} 💬${p.comments}\n"${p.title}"${p.body ? `\n${p.body.slice(0, 150)}` : ""}`
+    `[${i + 1}] ${p.sub} ↑${p.score} 💬${p.comments}\n"${p.title}"${p.body ? `\n${p.body.slice(0, 150)}` : ""}`
   ).join("\n\n");
 
   return claudeJSON(
-    `You are a product market researcher. You receive real Reddit posts and identify recurring pain point themes. Return ONLY a raw JSON array. No markdown fences, no preamble.`,
-    `Here are ${posts.slice(0, 60).length} real Reddit posts found by searching for pain-point language:
+    `You are a product market researcher. You receive real posts from tech/business communities (Hacker News, Stack Exchange, GitHub Issues) and identify recurring pain point themes. Return ONLY a raw JSON array. No markdown fences, no preamble.`,
+    `Here are ${posts.slice(0, 60).length} real posts found by searching for pain-point language:
 
 ${postList}
 
@@ -228,7 +393,7 @@ Return ONLY this JSON array:
     "id": 1,
     "topic": "Theme title (4-6 words)",
     "summary": "One sentence: the core pain people feel",
-    "subreddits": ["r/example"],
+    "sources": ["Hacker News", "softwarerecs"],
     "signal_strength": 8,
     "signal_reason": "Why demand is high",
     "post_indices": [1, 4, 7, 12],
@@ -249,15 +414,15 @@ async function drillTheme(theme, posts) {
   const pool = relevant.length >= 3 ? relevant : posts.slice(0, 25);
 
   const postList = pool.map(p =>
-    `• r/${p.sub} ↑${p.score} 💬${p.comments} | "${p.title}" | ${p.url}`
+    `• ${p.sub} ↑${p.score} 💬${p.comments} | "${p.title}" | ${p.url}`
   ).join("\n");
 
   return claudeJSON(
-    `You are a product market researcher turning Reddit pain points into buildable product ideas. Return ONLY a raw JSON array. No markdown fences, no preamble.`,
+    `You are a product market researcher turning real pain points into buildable product ideas. Return ONLY a raw JSON array. No markdown fences, no preamble.`,
     `Topic: "${theme.topic}"
 Pain: ${theme.summary}
 
-Supporting Reddit posts:
+Supporting posts:
 ${postList}
 
 Generate 5 specific, buildable product opportunities from these real posts.
@@ -268,7 +433,7 @@ Return ONLY this JSON array:
     "id": 1,
     "title": "Problem title (max 8 words)",
     "problem": "2-3 sentences describing the pain",
-    "subreddit": "r/most_relevant",
+    "source": "most relevant source, e.g. Hacker News or softwarerecs",
     "demand_score": 8,
     "demand_reason": "Why demand is strong",
     "product_angle": "Specific product or feature that solves this — be concrete",
@@ -293,7 +458,7 @@ function printThemes(themes) {
     }[t.category] || dim;
 
     log(`\n  ${bold(`#${i + 1}`)}  ${bold(t.topic)}`);
-    log(`      ${cc(`[${t.category}]`)}  ${dim(t.subreddits?.join(" · ") || "")}`);
+    log(`      ${cc(`[${t.category}]`)}  ${dim(t.sources?.join(" · ") || "")}`);
     log(`      ${bar(t.signal_strength)} ${scoreColor(t.signal_strength)}`);
     log(`      ${t.summary}`);
     log(`      ${dim(t.signal_reason)}`);
@@ -308,7 +473,7 @@ function printOpportunities(theme, opps) {
     const effortColor = o.build_effort === "low" ? grn : o.build_effort === "high" ? red : yel;
 
     log(`\n  ${bold(`#${i + 1}  ${o.title}`)}`);
-    log(`      ${dim(o.subreddit)}  ·  Demand: ${bar(o.demand_score, 10, 12)} ${scoreColor(o.demand_score)}  ·  Build effort: ${effortColor(o.build_effort || "?")}`);
+    log(`      ${dim(o.source)}  ·  Demand: ${bar(o.demand_score, 10, 12)} ${scoreColor(o.demand_score)}  ·  Build effort: ${effortColor(o.build_effort || "?")}`);
     log("");
     log(`      ${c.bold}Problem${c.reset}`);
     log(`      ${o.problem}`);
@@ -330,7 +495,7 @@ function printTopPosts(posts) {
   section(`TOP POSTS BY ENGAGEMENT (showing 15)`);
   posts.slice(0, 15).forEach((p, i) => {
     log(`  ${dim(`${i + 1}.`)} ${bold(`↑${p.score}`)} ${dim(`💬${p.comments}`)}  ${p.title.slice(0, 80)}${p.title.length > 80 ? "…" : ""}`);
-    log(`     ${dim(`r/${p.sub}  →  ${p.url}`)}`);
+    log(`     ${dim(`${p.sub}  →  ${p.url}`)}`);
   });
 }
 
@@ -342,28 +507,33 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function main() {
   console.clear();
-  log(`\n${org("█")} ${bold("REDDIT SIGNAL SCANNER")}`);
-  log(`${dim("  Finds real product opportunities from Reddit pain points")}\n`);
+  log(`\n${org("█")} ${bold("SIGNAL SCANNER")}`);
+  log(`${dim("  Finds real product opportunities from pain points across Hacker News, Stack Exchange & GitHub")}\n`);
 
   if (TOPIC_ARG) {
     log(`${cyn(`  Topic filter: "${TOPIC_ARG}"`)}\n`);
   }
 
   // Step 1: gather posts
-  section("STEP 1 — FETCHING REDDIT POSTS");
+  section("STEP 1 — FETCHING POSTS");
   const posts = await gatherPosts(TOPIC_ARG);
 
   if (posts.length < 5) {
-    log(red("\n  Too few posts returned. Reddit may be rate-limiting. Try again in a moment.\n"));
+    log(red("\n  Too few posts returned. Try again in a moment, or broaden --topic.\n"));
     process.exit(1);
   }
 
   printTopPosts(posts);
 
+  // Build a source-balanced pool so one loud source (e.g. Hacker News' point
+  // scale) can't crowd out the others — same pool is used for numbering AND
+  // for resolving post_indices back to posts, so they must stay in sync.
+  const pool = diversify(posts);
+
   // Step 2: analyse themes
   section("STEP 2 — CLUSTERING INTO THEMES (Claude)");
-  info("Sending posts to Claude for analysis…");
-  const themes = await analyseThemes(posts);
+  info(`Sending ${pool.length} source-balanced posts to Claude for analysis…`);
+  const themes = await analyseThemes(pool);
   ok(`Found ${themes.length} themes`);
   themes.sort((a, b) => b.signal_strength - a.signal_strength);
   printThemes(themes);
@@ -374,7 +544,7 @@ async function main() {
   for (const theme of themes.slice(0, 3)) {
     info(`Drilling: "${theme.topic}"…`);
     try {
-      const opps = await drillTheme(theme, posts);
+      const opps = await drillTheme(theme, pool);
       opps.sort((a, b) => b.demand_score - a.demand_score);
       printOpportunities(theme, opps);
     } catch (e) {
@@ -384,8 +554,8 @@ async function main() {
   }
 
   section("DONE");
-  log(`  ${grn("✓")} Scan complete. ${dim(`${posts.length} posts analysed across ${SUBREDDITS.length} subreddits.`)}`);
-  log(`  ${dim("Run again for fresh results — Reddit data changes daily.")}\n`);
+  log(`  ${grn("✓")} Scan complete. ${dim(`${posts.length} posts analysed across Hacker News, ${SE_SITES.length} Stack Exchange communities, ${DISCOURSE_FORUMS.length} forums${GITHUB_TOKEN ? ", and GitHub Issues" : ""}.`)}`);
+  log(`  ${dim("Run again for fresh results — signal changes daily.")}\n`);
 }
 
 main().catch(e => {
